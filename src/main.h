@@ -29,6 +29,9 @@
 #define ADDR_WAYPOINT2_SET 53
 #define ADDR_WAYPOINT3_SET 54
 #define ADDR_SETTINGS 60
+#define ADDR_LAST_LAT 70
+#define ADDR_LAST_LON 78
+#define ADDR_LAST_VALID 86
 
 // SCREEN DEFINITIONS
 enum ScreenType {
@@ -48,9 +51,9 @@ enum ScreenType {
 
 // POWER MODES
 enum PowerMode {
-    POWER_FULL = 0,
-    POWER_ECO,
-    POWER_SLEEP
+    POWER_FULL = 0,     // 1s refresh, full performance
+    POWER_ECO,          // 3s refresh, balanced performance  
+    POWER_ULTRA         // 10s refresh, minimal power consumption
 };
 
 // WAYPOINT STRUCTURE
@@ -61,10 +64,35 @@ struct Waypoint {
     char name[12];
 };
 
+// GPS CONSTELLATION TRACKING
+struct ConstellationInfo {
+    int count;
+    float avgSNR;
+    bool hasFix;
+};
+
+// GPS MOTION STATE
+enum MotionState {
+    MOTION_UNKNOWN = 0,
+    MOTION_STATIONARY,
+    MOTION_SLOW,
+    MOTION_MOVING,
+    MOTION_FAST
+};
+
 class HTITTracker {
 private:
     // Display instance
     HT_st7735 st7735;
+    
+    // Enhanced GPS Performance
+    ConstellationInfo constellations[5];  // GPS, GLONASS, Beidou, Galileo, QZSS
+    MotionState currentMotionState;
+    unsigned long lastPositionTime;
+    double lastStoredLat, lastStoredLon;
+    bool hasStoredPosition;
+    unsigned long gpsUpdateInterval;      // Adaptive GPS polling rate
+    unsigned long lastGPSPoll;
     
     // Satellite counts per constellation
     int gpsCount;
@@ -121,6 +149,10 @@ private:
     bool isCharging;                   // Whether battery is currently charging
     unsigned long lastChargingCheck;   // Time of last charging check
     
+    // Smart Power Management
+    PowerMode currentPowerMode;        // Current power mode (Full/Eco/Ultra)
+    unsigned long lastScreenUpdate;   // Time of last screen refresh
+    
     // Previous display state for flicker-free updates
     char prevFixBuf[16];
     char prevDistBuf[16]; 
@@ -150,6 +182,21 @@ private:
     void updateStatusScreen(int pct_cal);
     void updateNavigationScreen(int pct_cal);
     
+    // Enhanced GPS Performance
+    void updateConstellationInfo();
+    void analyzeMotionState();
+    void adaptGPSUpdateRate();
+    void storeLastPosition();
+    void loadLastPosition();
+    bool isPositionStationary();
+    
+    // UI/UX Enhancement methods
+    void drawProgressBar(int x, int y, int width, int height, int percentage, uint16_t color);
+    void drawBatteryIcon(int x, int y, int percentage);
+    void drawGPSIcon(int x, int y, int signalStrength);
+    void drawPowerModeIcon(int x, int y, PowerMode mode);
+    uint16_t getStatusColor(int value, int goodThreshold, int okThreshold);
+    
     // Enhanced UI screen methods
     void updateMainMenuScreen();
     void updateWaypointMenuScreen();
@@ -163,6 +210,12 @@ private:
     void calculateSpeed();
     int getStableBatteryPercent(float voltage);
     void updateChargingStatus(float voltage);
+    
+    // Smart Power Management
+    void setPowerMode(PowerMode mode);
+    bool shouldUpdateScreen();
+    unsigned long getPowerModeInterval();
+    const char* getPowerModeString();
     
     // Enhanced navigation methods
     float calculateBearingToHome();
@@ -213,7 +266,18 @@ inline HTITTracker::HTITTracker()
       lastActivity(0), forceScreenRedraw(false), lastLat(0.0), lastLon(0.0), 
       lastSpeedTime(0), currentSpeed(0.0f), hasValidSpeed(false), 
       prevDisplayValid(false), batteryIndex(0), batteryBufferFull(false), 
-      lastBatteryVoltage(0.0f), isCharging(false), lastChargingCheck(0) {
+      lastBatteryVoltage(0.0f), isCharging(false), lastChargingCheck(0),
+      currentPowerMode(POWER_FULL), lastScreenUpdate(0),
+      currentMotionState(MOTION_UNKNOWN), lastPositionTime(0),
+      lastStoredLat(0.0), lastStoredLon(0.0), hasStoredPosition(false),
+      gpsUpdateInterval(1000), lastGPSPoll(0) {
+    
+    // Initialize constellation info
+    for (int i = 0; i < 5; i++) {
+        constellations[i].count = 0;
+        constellations[i].avgSNR = 0.0f;
+        constellations[i].hasFix = false;
+    }
     
     // Initialize waypoints as unset
     for (int i = 0; i < 3; i++) {
@@ -241,7 +305,7 @@ inline void HTITTracker::begin() {
     Serial.begin(115200);
     while (!Serial) { delay(10); }
     Serial.println();
-    Serial.println("HTIT-Tracker v1.2: 5-Row Display with Home Navigation");
+    Serial.println("HTIT-Tracker v1.2 Enhanced: GPS Performance + UI Improvements");
 
     // 2) Configure VBAT_EN (GPIO 2) and keep LOW until measurement
     pinMode(VBAT_EN, OUTPUT);
@@ -277,30 +341,44 @@ inline void HTITTracker::begin() {
     EEPROM.begin(512);  // Initialize EEPROM with 512 bytes
     Serial.println("→ EEPROM initialized (512 bytes)");
     loadWaypointsFromEEPROM();
+    loadLastPosition();  // Load GPS warm start data
+    
+    // 10) Initialize activity timer for screensaver
+    lastActivity = millis();
+    Serial.println("→ Enhanced GPS and UI features initialized");
 }
 
 inline void HTITTracker::update() {
     // A) Check button for screen switching
     checkButton();
     
-    // B) Read raw NMEA from Serial1, echo to USB-Serial, accumulate lines
-    while (Serial1.available() > 0) {
-        char c = (char)Serial1.read();
-        Serial.write(c);  // echo raw NMEA
-        if (c == '\r' || c == '\n') {
-            if (linePos > 0) {
-                lineBuf[linePos] = '\0';
-                processNMEALine(lineBuf);
-                linePos = 0;
+    // B) Enhanced GPS Performance Updates
+    updateConstellationInfo();
+    analyzeMotionState();
+    adaptGPSUpdateRate();
+    
+    // C) Read raw NMEA from Serial1, echo to USB-Serial, accumulate lines
+    unsigned long now = millis();
+    if (now - lastGPSPoll >= gpsUpdateInterval) {
+        lastGPSPoll = now;
+        
+        while (Serial1.available() > 0) {
+            char c = (char)Serial1.read();
+            Serial.write(c);  // echo raw NMEA
+            if (c == '\r' || c == '\n') {
+                if (linePos > 0) {
+                    lineBuf[linePos] = '\0';
+                    processNMEALine(lineBuf);
+                    linePos = 0;
+                }
             }
-        }
-        else if (linePos < (int)sizeof(lineBuf) - 1) {
-            lineBuf[linePos++] = c;
+            else if (linePos < (int)sizeof(lineBuf) - 1) {
+                lineBuf[linePos++] = c;
+            }
         }
     }
 
-    // C) Once per second, update display
-    unsigned long now = millis();
+    // E) Once per second, update display
     if (now - lastLCDupdate >= LCD_INTERVAL) {
         lastLCDupdate = now;
 
@@ -368,6 +446,14 @@ inline void HTITTracker::processNMEALine(const char* line) {
             currentLat = lat;
             currentLon = lon;
             hasValidPosition = true;
+            lastPositionTime = millis();
+            
+            // Store position for GPS warm start (every 30 seconds)
+            static unsigned long lastPositionStore = 0;
+            if (millis() - lastPositionStore > 30000) {
+                storeLastPosition();
+                lastPositionStore = millis();
+            }
             
             // Calculate speed if we have a previous position
             calculateSpeed();
@@ -576,6 +662,7 @@ inline void HTITTracker::checkButton() {
         if (now - lastButtonPress > 200) {  // 200ms debounce
             buttonPressStart = now;
             longPressHandled = false;
+            lastActivity = now;  // Update activity for potential future features
         }
     }
     
@@ -710,42 +797,28 @@ inline void HTITTracker::checkButton() {
                 }
                 
             } else if (currentScreen == SCREEN_POWER_MENU) {
-                // Handle power menu actions
-                if (menuIndex == 0) {  // Sleep Mode (light sleep with quick wake)
-                    st7735.st7735_fill_screen(ST7735_BLACK);
-                    st7735.st7735_write_str(0, 0, "ENTERING SLEEP");
-                    st7735.st7735_write_str(0, 16, "Press to wake");
-                    delay(1000);
-                    
-                    // Enter light sleep - wakes on button press
-                    esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);  // Wake on button press (LOW)
-                    esp_light_sleep_start();
-                    
-                    // When we wake up, return to main menu
+                // Handle power mode selection
+                if (menuIndex == 0) {  // Full Power Mode
+                    setPowerMode(POWER_FULL);
                     currentScreen = SCREEN_MAIN_MENU;
-                    menuIndex = 0;
-                    Serial.println("→ Woke from sleep, returning to main menu");
+                    menuIndex = 3;  // Return to Power Menu item in main menu
+                    Serial.println("→ Set to Full Power Mode (1s refresh)");
                     
-                } else if (menuIndex == 1) {  // Deep Sleep (full power down)
-                    st7735.st7735_fill_screen(ST7735_BLACK);
-                    st7735.st7735_write_str(0, 0, "DEEP SLEEP");
-                    st7735.st7735_write_str(0, 16, "Hold button");
-                    st7735.st7735_write_str(0, 32, "to wake up");
-                    delay(2000);
+                } else if (menuIndex == 1) {  // Eco Mode
+                    setPowerMode(POWER_ECO);
+                    currentScreen = SCREEN_MAIN_MENU;
+                    menuIndex = 3;  // Return to Power Menu item in main menu
+                    Serial.println("→ Set to Eco Mode (3s refresh)");
                     
-                    // Enter deep sleep - only wakes on button press
-                    esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);  // Wake on button press (LOW)
-                    esp_deep_sleep_start();
-                    // Device will restart when woken
-                    
-                } else if (menuIndex == 2) {  // Screen Off (turn off display)
-                    st7735.st7735_fill_screen(ST7735_BLACK);
-                    currentScreen = SCREEN_STATUS;  // Go to status when reactivated
-                    Serial.println("→ Screen off mode activated");
+                } else if (menuIndex == 2) {  // Ultra Saver Mode
+                    setPowerMode(POWER_ULTRA);
+                    currentScreen = SCREEN_MAIN_MENU;
+                    menuIndex = 3;  // Return to Power Menu item in main menu
+                    Serial.println("→ Set to Ultra Saver Mode (10s refresh)");
                     
                 } else if (menuIndex == 3) {  // Back
                     currentScreen = SCREEN_MAIN_MENU;
-                    menuIndex = 4;  // Return to Power Menu item in main menu
+                    menuIndex = 3;  // Return to Power Menu item in main menu
                     Serial.println("→ Back to Main Menu");
                 }
                 
@@ -876,7 +949,57 @@ inline void HTITTracker::updateChargingStatus(float voltage) {
     lastChargingCheck = now;
 }
 
+// ========================== SMART POWER MANAGEMENT ==========================
+
+inline void HTITTracker::setPowerMode(PowerMode mode) {
+    currentPowerMode = mode;
+    forceScreenRedraw = true;  // Force immediate update when mode changes
+    Serial.print("→ Power mode changed to: ");
+    Serial.println(getPowerModeString());
+}
+
+inline bool HTITTracker::shouldUpdateScreen() {
+    unsigned long now = millis();
+    unsigned long interval = getPowerModeInterval();
+    
+    if (now - lastScreenUpdate >= interval) {
+        lastScreenUpdate = now;
+        return true;
+    }
+    
+    // Always allow updates if forced or first time
+    if (forceScreenRedraw || lastScreenUpdate == 0) {
+        lastScreenUpdate = now;
+        return true;
+    }
+    
+    return false;
+}
+
+inline unsigned long HTITTracker::getPowerModeInterval() {
+    switch (currentPowerMode) {
+        case POWER_FULL:  return 1000;   // 1 second - maximum responsiveness
+        case POWER_ECO:   return 3000;   // 3 seconds - balanced performance
+        case POWER_ULTRA: return 10000;  // 10 seconds - minimal power consumption
+        default:          return 1000;   // Default to full power
+    }
+}
+
+inline const char* HTITTracker::getPowerModeString() {
+    switch (currentPowerMode) {
+        case POWER_FULL:  return "Full Power";
+        case POWER_ECO:   return "Eco Mode";  
+        case POWER_ULTRA: return "Ultra Saver";
+        default:          return "Unknown";
+    }
+}
+
 inline void HTITTracker::updateLCD(int pct_cal) {
+    // Smart Power Management: Only update screen based on power mode interval
+    if (!shouldUpdateScreen()) {
+        return;  // Skip screen update to save power
+    }
+    
     // Reset screen state when switching screens
     static ScreenType lastDisplayedScreen = SCREEN_MAIN_MENU;
     if (currentScreen != lastDisplayedScreen) {
@@ -933,7 +1056,15 @@ inline void HTITTracker::updateStatusScreen(int pct_cal) {
     }
     
     char satBuf[16];
-    sprintf(satBuf, "Sats:%3d     ", totalInView);
+    if (totalInView >= 12) {
+        sprintf(satBuf, "Sats:%3d +++", totalInView);  // Excellent signal
+    } else if (totalInView >= 8) {
+        sprintf(satBuf, "Sats:%3d ++  ", totalInView);  // Good signal
+    } else if (totalInView >= 4) {
+        sprintf(satBuf, "Sats:%3d +   ", totalInView);  // Basic signal
+    } else {
+        sprintf(satBuf, "Sats:%3d     ", totalInView);  // Poor signal
+    }
     
     char battBuf[16];
     sprintf(battBuf, "Batt:%3d%%    ", pct_cal);  // Consistent with GitHub - no charging indicator
@@ -941,7 +1072,11 @@ inline void HTITTracker::updateStatusScreen(int pct_cal) {
     float accuracy = lastHDOP * 5.0f;  // HDOP × 5 m
     char accBuf[16];
     if (haveFix && lastHDOP > 0.0f && lastHDOP < 100.0f) {
-        sprintf(accBuf, "Acc:%4.1fm   ", accuracy);
+        if (accuracy < 10.0) {
+            sprintf(accBuf, "Acc:%4.1fm   ", accuracy);  // Show decimal for high accuracy
+        } else {
+            sprintf(accBuf, "Acc:%3.0fm    ", accuracy);  // Integer for lower accuracy
+        }
     } else {
         sprintf(accBuf, "Acc: --.-m   ");
     }
@@ -992,18 +1127,26 @@ inline void HTITTracker::updateNavigationScreen(int pct_cal) {
     char distBuf[16];
     if (homeEstablished && hasValidPosition) {
         float distanceToHome = calculateDistanceToHome();
-        if (distanceToHome < 1000) {
-            sprintf(distBuf, "Home:%3.0fm   ", distanceToHome);
+        if (distanceToHome < 100) {
+            sprintf(distBuf, "Home:%4.1fm  ", distanceToHome);  // Show decimal for close distances
+        } else if (distanceToHome < 1000) {
+            sprintf(distBuf, "Home:%3.0fm   ", distanceToHome);  // Integer meters for medium distances
+        } else if (distanceToHome < 10000) {
+            sprintf(distBuf, "Home:%3.1fkm  ", distanceToHome / 1000.0);  // One decimal for km
         } else {
-            sprintf(distBuf, "Home:%3.1fkm  ", distanceToHome / 1000.0);
+            sprintf(distBuf, "Home:%3.0fkm  ", distanceToHome / 1000.0);  // Integer km for long distances
         }
     } else {
         sprintf(distBuf, "Home: --.-m   ");
     }
     
-    char speedBuf[16];
-    if (hasValidSpeed && currentSpeed < 99.9) {
-        sprintf(speedBuf, "Spd:%4.1fkm/h ", currentSpeed);
+    char speedBuf[20];  // Increased buffer size for higher speeds
+    if (hasValidSpeed) {
+        if (currentSpeed >= 100.0) {
+            sprintf(speedBuf, "Spd:%3.0fkm/h ", currentSpeed);  // No decimal for 100+ km/h
+        } else {
+            sprintf(speedBuf, "Spd:%4.1fkm/h ", currentSpeed);  // One decimal for under 100
+        }
     } else {
         sprintf(speedBuf, "Spd: -.-km/h ");
     }
@@ -1211,20 +1354,28 @@ inline void HTITTracker::updateWaypointNavigationScreen(int pct_cal) {
     char distBuf[16];
     if (hasValidPosition && waypointIndex >= 0 && waypointIndex < 3 && waypoints[waypointIndex].isSet) {
         float distanceToWaypoint = calculateDistanceToWaypoint(waypointIndex);
-        if (distanceToWaypoint < 1000) {
-            sprintf(distBuf, "WP%d:%3.0fm   ", activeWaypoint, distanceToWaypoint);  // EXACT GitHub format
+        if (distanceToWaypoint < 100) {
+            sprintf(distBuf, "WP%d:%4.1fm  ", activeWaypoint, distanceToWaypoint);  // Show decimal for close distances
+        } else if (distanceToWaypoint < 1000) {
+            sprintf(distBuf, "WP%d:%3.0fm   ", activeWaypoint, distanceToWaypoint);  // Integer meters for medium distances
+        } else if (distanceToWaypoint < 10000) {
+            sprintf(distBuf, "WP%d:%3.1fkm  ", activeWaypoint, distanceToWaypoint / 1000.0);  // One decimal for km
         } else {
-            sprintf(distBuf, "WP%d:%3.1fkm  ", activeWaypoint, distanceToWaypoint / 1000.0);
+            sprintf(distBuf, "WP%d:%3.0fkm  ", activeWaypoint, distanceToWaypoint / 1000.0);  // Integer km for long distances
         }
     } else {
         sprintf(distBuf, "WP%d: --.-m   ", activeWaypoint);  // EXACT GitHub spacing
     }
     
-    char speedBuf[16];
-    if (hasValidSpeed && currentSpeed < 99.9) {
-        sprintf(speedBuf, "Spd:%4.1fkm/h ", currentSpeed);  // EXACT GitHub format
+    char speedBuf[20];  // Increased buffer size for higher speeds
+    if (hasValidSpeed) {
+        if (currentSpeed >= 100.0) {
+            sprintf(speedBuf, "Spd:%3.0fkm/h ", currentSpeed);  // No decimal for 100+ km/h (e.g., "Spd:120km/h")
+        } else {
+            sprintf(speedBuf, "Spd:%4.1fkm/h ", currentSpeed);  // One decimal for under 100 (e.g., "Spd:85.3km/h")
+        }
     } else {
-        sprintf(speedBuf, "Spd: -.-km/h ");  // EXACT GitHub spacing
+        sprintf(speedBuf, "Spd: -.-km/h ");  // No valid speed data
     }
     
     char battBuf[16];
@@ -1329,18 +1480,43 @@ inline void HTITTracker::updateSystemInfoScreen(int pct_cal) {
     static bool screenInitialized = false;
     static int lastSatCount = -1;
     static int lastBattPercent = -1;
+    static PowerMode lastMode = POWER_FULL;
     
-    bool needsRedraw = !screenInitialized || (totalInView != lastSatCount) || (pct_cal != lastBattPercent);
+    bool needsRedraw = !screenInitialized || (totalInView != lastSatCount) || 
+                       (pct_cal != lastBattPercent) || (currentPowerMode != lastMode);
     
     if (needsRedraw) {
         st7735.st7735_fill_screen(ST7735_BLACK);
-        st7735.st7735_write_str(0, 0, "SYSTEM INFO");
-        st7735.st7735_write_str(0, 16, "FW: v1.2 Enh");
-        st7735.st7735_write_str(0, 32, String("Sats: " + String(totalInView)));
-        st7735.st7735_write_str(0, 48, String("Batt: " + String(pct_cal) + "%"));
+        st7735.st7735_write_str(0, 0, "SYSTEM INFO Enhanced");
+        st7735.st7735_write_str(0, 12, "FW: v1.2 GPS+UI");
+        
+        // Enhanced satellite display with constellation breakdown
+        String satText = "Sats: " + String(totalInView);
+        if (totalInView > 0) {
+            satText += " G:" + String(gpsCount) + " R:" + String(glonassCount) + 
+                      " B:" + String(beidouCount);
+        }
+        st7735.st7735_write_str(0, 24, satText);
+        
+        // Enhanced battery display with charging indicator and progress bar
+        String battText = "Batt: " + String(pct_cal) + "%";
+        if (isCharging) {
+            battText += " CHRG";  // Add charging indicator
+        }
+        st7735.st7735_write_str(0, 36, battText);
+        
+        // Show current power mode and motion state
+        String modeText = "Mode: " + String(getPowerModeString());
+        if (currentMotionState == MOTION_STATIONARY) modeText += " STAT";
+        else if (currentMotionState == MOTION_MOVING) modeText += " MOV";
+        st7735.st7735_write_str(0, 48, modeText);
+        
+        // Show GPS update interval for debugging
+        st7735.st7735_write_str(0, 60, String("GPS:" + String(gpsUpdateInterval/1000) + "s"));
         
         lastSatCount = totalInView;
         lastBattPercent = pct_cal;
+        lastMode = currentPowerMode;
         screenInitialized = true;
     }
 }
@@ -1348,16 +1524,29 @@ inline void HTITTracker::updateSystemInfoScreen(int pct_cal) {
 inline void HTITTracker::updatePowerMenuScreen() {
     static int lastMenuIndex = -1;
     static bool screenInitialized = false;
+    static PowerMode lastPowerMode = POWER_FULL;
     
-    if (!screenInitialized || forceScreenRedraw || lastMenuIndex != menuIndex) {
+    bool needsRedraw = !screenInitialized || forceScreenRedraw || 
+                      lastMenuIndex != menuIndex || lastPowerMode != currentPowerMode;
+    
+    if (needsRedraw) {
         st7735.st7735_fill_screen(ST7735_BLACK);
-        st7735.st7735_write_str(0, 0, "POWER MENU");
+        st7735.st7735_write_str(0, 0, "POWER");
         
-        // Power menu options
-        const char* item0 = (menuIndex == 0) ? "> Sleep Mode" : "  Sleep Mode";
-        const char* item1 = (menuIndex == 1) ? "> Deep Sleep" : "  Deep Sleep";
-        const char* item2 = (menuIndex == 2) ? "> Screen Off" : "  Screen Off";
-        const char* item3 = (menuIndex == 3) ? "> Back" : "  Back";
+        // Compact power menu options with current mode indicator
+        String item0 = (menuIndex == 0) ? ">" : " ";
+        item0 += "Full";
+        if (currentPowerMode == POWER_FULL) item0 += "*";
+        
+        String item1 = (menuIndex == 1) ? ">" : " ";
+        item1 += "Eco";
+        if (currentPowerMode == POWER_ECO) item1 += "*";
+        
+        String item2 = (menuIndex == 2) ? ">" : " ";
+        item2 += "Ultra";
+        if (currentPowerMode == POWER_ULTRA) item2 += "*";
+        
+        const char* item3 = (menuIndex == 3) ? ">Back" : " Back";
         
         st7735.st7735_write_str(0, 16, item0);
         st7735.st7735_write_str(0, 32, item1);
@@ -1365,6 +1554,7 @@ inline void HTITTracker::updatePowerMenuScreen() {
         st7735.st7735_write_str(0, 64, item3);
         
         lastMenuIndex = menuIndex;
+        lastPowerMode = currentPowerMode;
         screenInitialized = true;
         forceScreenRedraw = false;
     }
@@ -1472,6 +1662,184 @@ inline float HTITTracker::calculateDistanceToWaypoint(int waypointIndex) {
     const double EARTH_RADIUS = 6371000.0;
     
     return EARTH_RADIUS * c;  // Distance in meters
+}
+
+// ========================== ENHANCED GPS PERFORMANCE ==========================
+
+inline void HTITTracker::updateConstellationInfo() {
+    // Update constellation statistics
+    constellations[0].count = gpsCount;
+    constellations[1].count = glonassCount;
+    constellations[2].count = beidouCount;
+    constellations[3].count = galileoCount;
+    constellations[4].count = qzssCount;
+    
+    // Check which constellations have fixes
+    for (int i = 0; i < 5; i++) {
+        constellations[i].hasFix = (constellations[i].count > 0 && haveFix);
+    }
+}
+
+inline void HTITTracker::analyzeMotionState() {
+    if (!hasValidPosition || !hasValidSpeed) {
+        currentMotionState = MOTION_UNKNOWN;
+        return;
+    }
+    
+    // Analyze motion based on speed
+    if (currentSpeed < 0.5f) {
+        currentMotionState = MOTION_STATIONARY;
+    } else if (currentSpeed < 5.0f) {
+        currentMotionState = MOTION_SLOW;
+    } else if (currentSpeed < 50.0f) {
+        currentMotionState = MOTION_MOVING;
+    } else {
+        currentMotionState = MOTION_FAST;
+    }
+}
+
+inline void HTITTracker::adaptGPSUpdateRate() {
+    unsigned long newInterval;
+    
+    // Adapt GPS update rate based on motion and power mode
+    switch (currentMotionState) {
+        case MOTION_STATIONARY:
+            newInterval = 5000;  // 5 seconds when stationary
+            break;
+        case MOTION_SLOW:
+            newInterval = 2000;  // 2 seconds when moving slowly
+            break;
+        case MOTION_MOVING:
+        case MOTION_FAST:
+            newInterval = 1000;  // 1 second when moving fast
+            break;
+        default:
+            newInterval = 1000;  // Default 1 second
+            break;
+    }
+    
+    // Factor in power mode
+    switch (currentPowerMode) {
+        case POWER_ECO:
+            newInterval *= 2;  // Double the interval in eco mode
+            break;
+        case POWER_ULTRA:
+            newInterval *= 3;  // Triple the interval in ultra mode
+            break;
+        default:
+            break;
+    }
+    
+    gpsUpdateInterval = newInterval;
+}
+
+inline void HTITTracker::storeLastPosition() {
+    if (hasValidPosition) {
+        EEPROM.put(ADDR_LAST_LAT, currentLat);
+        EEPROM.put(ADDR_LAST_LON, currentLon);
+        EEPROM.put(ADDR_LAST_VALID, true);
+        EEPROM.commit();
+        lastStoredLat = currentLat;
+        lastStoredLon = currentLon;
+        hasStoredPosition = true;
+        Serial.println("→ Position stored for GPS warm start");
+    }
+}
+
+inline void HTITTracker::loadLastPosition() {
+    bool isValid;
+    EEPROM.get(ADDR_LAST_VALID, isValid);
+    
+    if (isValid) {
+        EEPROM.get(ADDR_LAST_LAT, lastStoredLat);
+        EEPROM.get(ADDR_LAST_LON, lastStoredLon);
+        hasStoredPosition = true;
+        Serial.println("→ Last position loaded for GPS warm start");
+    } else {
+        hasStoredPosition = false;
+        Serial.println("→ No previous position found");
+    }
+}
+
+inline bool HTITTracker::isPositionStationary() {
+    return (currentMotionState == MOTION_STATIONARY);
+}
+
+// ========================== UI/UX ENHANCEMENTS ==========================
+
+inline void HTITTracker::drawProgressBar(int x, int y, int width, int height, int percentage, uint16_t color) {
+    // Create text-based progress bar since HT_st7735 doesn't support graphics
+    char progressBar[21] = {0}; // 20 characters + null terminator
+    int barLength = 20;
+    int fillChars = (barLength * percentage) / 100;
+    
+    progressBar[0] = '[';
+    for (int i = 1; i <= barLength; i++) {
+        if (i <= fillChars) {
+            progressBar[i] = '=';
+        } else {
+            progressBar[i] = ' ';
+        }
+    }
+    progressBar[barLength + 1] = ']';
+    progressBar[barLength + 2] = '\0';
+    
+    st7735.st7735_write_str(x, y, progressBar);
+}
+
+inline void HTITTracker::drawBatteryIcon(int x, int y, int percentage) {
+    // Create text-based battery indicator
+    char battIcon[8];
+    if (percentage > 75) {
+        strcpy(battIcon, "BATT +++");
+    } else if (percentage > 50) {
+        strcpy(battIcon, "BATT ++");
+    } else if (percentage > 25) {
+        strcpy(battIcon, "BATT +");
+    } else {
+        strcpy(battIcon, "BATT LOW");
+    }
+    
+    st7735.st7735_write_str(x, y, battIcon);
+}
+
+inline void HTITTracker::drawGPSIcon(int x, int y, int signalStrength) {
+    // Create text-based GPS signal indicator
+    char gpsIcon[12];
+    if (signalStrength >= 8) {
+        strcpy(gpsIcon, "GPS +++");
+    } else if (signalStrength >= 4) {
+        strcpy(gpsIcon, "GPS ++");
+    } else if (signalStrength >= 1) {
+        strcpy(gpsIcon, "GPS +");
+    } else {
+        strcpy(gpsIcon, "GPS ---");
+    }
+    
+    st7735.st7735_write_str(x, y, gpsIcon);
+}
+
+inline void HTITTracker::drawPowerModeIcon(int x, int y, PowerMode mode) {
+    // Create text-based power mode indicator
+    const char* modeStr;
+    switch (mode) {
+        case POWER_FULL:  modeStr = "PWR:FULL"; break;
+        case POWER_ECO:   modeStr = "PWR:ECO"; break;
+        case POWER_ULTRA: modeStr = "PWR:ULTRA"; break;
+        default:          modeStr = "PWR:???"; break;
+    }
+    
+    st7735.st7735_write_str(x, y, modeStr);
+}
+
+inline uint16_t HTITTracker::getStatusColor(int value, int goodThreshold, int okThreshold) {
+    if (value >= goodThreshold) {
+        return ST7735_GREEN;
+    } else if (value >= okThreshold) {
+        return ST7735_YELLOW;
+    } else {
+        return ST7735_RED;
+    }
 }
 
 #endif // MAIN_H
