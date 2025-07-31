@@ -2,7 +2,9 @@
 #define MAIN_H
 
 #include <Arduino.h>
-#include <HT_st7735.h>
+#include <Adafruit_ST7735.h>
+#include <Adafruit_GFX.h>
+#include <SPI.h>
 #include <EEPROM.h>
 #include <esp_sleep.h>
 
@@ -15,7 +17,14 @@
 #define BL_CTRL_PIN  21   // GPIO 21 enables ST7735 backlight (HIGH = on)
 #define USER_BTN_PIN  0   // GPIO 0 is the USER button (active-low)
 
-// EEPROM ADDRESSES
+// UI/UX SPACING STANDARDS - COMPACT WHITE TEXT
+#define TEXT_LINE_HEIGHT 10     // Compact line spacing for small white text
+#define TEXT_ROW_0 0           // Title row
+#define TEXT_ROW_1 10          // First data row  
+#define TEXT_ROW_2 20          // Second data row
+#define TEXT_ROW_3 30          // Third data row
+#define TEXT_ROW_4 40          // Fourth data row
+#define TEXT_ROW_5 50          // Fifth data row (max for 5-row display)
 #define EEPROM_SIZE 512
 #define EEPROM_MAGIC 0xA5B4
 #define ADDR_MAGIC 0
@@ -44,6 +53,7 @@ enum ScreenType {
     SCREEN_WAYPOINT3_NAV,
     SCREEN_SET_WAYPOINT,
     SCREEN_SYSTEM_INFO,
+    SCREEN_GPS_STATUS,         // New: Detailed GPS constellation status
     SCREEN_POWER_MENU,
     SCREEN_WAYPOINT_RESET,     // Ask to reset waypoint or navigate
     SCREEN_COUNT
@@ -69,6 +79,7 @@ struct ConstellationInfo {
     int count;
     float avgSNR;
     bool hasFix;
+    bool isActiveForFix;  // New: Is this constellation contributing to the current fix
 };
 
 // GPS MOTION STATE
@@ -83,7 +94,14 @@ enum MotionState {
 class HTITTracker {
 private:
     // Display instance
-    HT_st7735 st7735;
+    // ST7735 Display pins for Heltec LoRa v3 
+#define TFT_CS    18  // Chip Select
+#define TFT_RST   21  // Reset
+#define TFT_DC    17  // Data/Command
+#define TFT_SCLK  5   // SPI Clock
+#define TFT_MOSI  6   // SPI MOSI
+
+Adafruit_ST7735 st7735 = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
     
     // Enhanced GPS Performance
     ConstellationInfo constellations[5];  // GPS, GLONASS, Beidou, Galileo, QZSS
@@ -203,6 +221,7 @@ private:
     void updateWaypointNavigationScreen(int pct_cal);
     void updateSetWaypointScreen();
     void updateSystemInfoScreen(int pct_cal);
+    void updateGPSStatusScreen(int pct_cal);  // New: GPS constellation status
     void updatePowerMenuScreen();
     void updateWaypointResetScreen();
     
@@ -277,6 +296,7 @@ inline HTITTracker::HTITTracker()
         constellations[i].count = 0;
         constellations[i].avgSNR = 0.0f;
         constellations[i].hasFix = false;
+        constellations[i].isActiveForFix = false;
     }
     
     // Initialize waypoints as unset
@@ -333,9 +353,15 @@ inline void HTITTracker::begin() {
     Serial1.begin(115200, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
     Serial.println("→ Serial1.begin(115200, RX=33, TX=34) for UC6580");
 
-    // 8) Initialize ST7735 display
-    st7735.st7735_init();
-    st7735.st7735_fill_screen(ST7735_BLACK);
+    // 8) Initialize ST7735 display with proper Adafruit library
+    st7735.initR(INITR_BLACKTAB);  // Initialize with black tab variant
+    st7735.fillScreen(ST7735_BLACK);
+    
+    // Configure text: WHITE color, small size (1), no wrap
+    st7735.setTextColor(ST7735_WHITE);
+    st7735.setTextSize(1);
+    st7735.setTextWrap(false);
+    st7735.setRotation(0);
     
     // 9) Initialize EEPROM and load waypoints
     EEPROM.begin(512);  // Initialize EEPROM with 512 bytes
@@ -675,7 +701,7 @@ inline void HTITTracker::checkButton() {
         
         // Long press actions - scroll through menu or return to main menu
         if (currentScreen == SCREEN_MAIN_MENU) {
-            menuIndex = (menuIndex + 1) % 4;  // 4 items in main menu now (removed Navigation)
+            menuIndex = (menuIndex + 1) % 5;  // 5 items in main menu now (added GPS Status)
             Serial.println("→ Main menu scroll (long press)");
         } else if (currentScreen == SCREEN_WAYPOINT_MENU) {
             menuIndex = (menuIndex + 1) % 4;  // 4 items in waypoint menu
@@ -703,7 +729,7 @@ inline void HTITTracker::checkButton() {
             lastActivity = now;
             
             if (currentScreen == SCREEN_MAIN_MENU) {
-                // Handle main menu selection (now has 4 items - removed Navigation)
+                // Handle main menu selection (now has 5 items - added GPS Status)
                 if (menuIndex == 0) {  // Status
                     currentScreen = SCREEN_STATUS;
                     Serial.println("→ Entered Status Screen");
@@ -714,7 +740,10 @@ inline void HTITTracker::checkButton() {
                 } else if (menuIndex == 2) {  // System Info
                     currentScreen = SCREEN_SYSTEM_INFO;
                     Serial.println("→ Entered System Info");
-                } else if (menuIndex == 3) {  // Power Menu
+                } else if (menuIndex == 3) {  // GPS Status
+                    currentScreen = SCREEN_GPS_STATUS;
+                    Serial.println("→ Entered GPS Status");
+                } else if (menuIndex == 4) {  // Power Menu
                     currentScreen = SCREEN_POWER_MENU;
                     Serial.println("→ Entered Power Menu");
                 }
@@ -1035,6 +1064,9 @@ inline void HTITTracker::updateLCD(int pct_cal) {
         case SCREEN_SYSTEM_INFO:
             updateSystemInfoScreen(pct_cal);
             break;
+        case SCREEN_GPS_STATUS:
+            updateGPSStatusScreen(pct_cal);
+            break;
         case SCREEN_POWER_MENU:
             updatePowerMenuScreen();
             break;
@@ -1057,13 +1089,15 @@ inline void HTITTracker::updateStatusScreen(int pct_cal) {
     
     char satBuf[16];
     if (totalInView >= 12) {
-        sprintf(satBuf, "Sats:%3d +++", totalInView);  // Excellent signal
+        sprintf(satBuf, "Sats:%3d 100%%", totalInView);  // Excellent signal (100%)
     } else if (totalInView >= 8) {
-        sprintf(satBuf, "Sats:%3d ++  ", totalInView);  // Good signal
+        sprintf(satBuf, "Sats:%3d 75%% ", totalInView);  // Good signal (75%)
     } else if (totalInView >= 4) {
-        sprintf(satBuf, "Sats:%3d +   ", totalInView);  // Basic signal
+        sprintf(satBuf, "Sats:%3d 50%% ", totalInView);  // Basic signal (50%)
+    } else if (totalInView >= 1) {
+        sprintf(satBuf, "Sats:%3d 25%% ", totalInView);  // Poor signal (25%)
     } else {
-        sprintf(satBuf, "Sats:%3d     ", totalInView);  // Poor signal
+        sprintf(satBuf, "Sats:%3d 0%%  ", totalInView);  // No signal (0%)
     }
     
     char battBuf[16];
@@ -1085,26 +1119,30 @@ inline void HTITTracker::updateStatusScreen(int pct_cal) {
     bool needsFullRedraw = !prevDisplayValid;
     
     if (needsFullRedraw) {
-        st7735.st7735_fill_screen(ST7735_BLACK);
+        st7735.fillScreen(ST7735_BLACK);
     }
     
     if (needsFullRedraw || strcmp(fixBuf, prevFixBuf) != 0) {
-        st7735.st7735_write_str(0, 0, String(fixBuf));
+        st7735.setCursor(0, TEXT_ROW_0);
+        st7735.print(fixBuf);
         strcpy(prevFixBuf, fixBuf);
     }
     
     if (needsFullRedraw || strcmp(satBuf, prevSatBuf) != 0) {
-        st7735.st7735_write_str(0, 16, String(satBuf));
+        st7735.setCursor(0, TEXT_ROW_1);
+        st7735.print(satBuf);
         strcpy(prevSatBuf, satBuf);
     }
     
     if (needsFullRedraw || strcmp(battBuf, prevBattBuf) != 0) {
-        st7735.st7735_write_str(0, 32, String(battBuf));
+        st7735.setCursor(0, TEXT_ROW_2);
+        st7735.print(battBuf);
         strcpy(prevBattBuf, battBuf);
     }
     
     if (needsFullRedraw || strcmp(accBuf, prevAccBuf) != 0) {
-        st7735.st7735_write_str(0, 48, String(accBuf));
+        st7735.setCursor(0, TEXT_ROW_3);
+        st7735.print(accBuf);
         strcpy(prevAccBuf, accBuf);
     }
     
@@ -1158,26 +1196,30 @@ inline void HTITTracker::updateNavigationScreen(int pct_cal) {
     bool needsFullRedraw = !prevDisplayValid;
     
     if (needsFullRedraw) {
-        st7735.st7735_fill_screen(ST7735_BLACK);
+        st7735.fillScreen(ST7735_BLACK);
     }
     
     if (needsFullRedraw || strcmp(dirBuf, prevFixBuf) != 0) {
-        st7735.st7735_write_str(0, 0, String(dirBuf));
+        st7735.setCursor(0, TEXT_ROW_0);
+        st7735.print(dirBuf);
         strcpy(prevFixBuf, dirBuf);
     }
     
     if (needsFullRedraw || strcmp(distBuf, prevDistBuf) != 0) {
-        st7735.st7735_write_str(0, 16, String(distBuf));
+        st7735.setCursor(0, TEXT_ROW_1);
+        st7735.print(distBuf);
         strcpy(prevDistBuf, distBuf);
     }
     
     if (needsFullRedraw || strcmp(speedBuf, prevSpeedBuf) != 0) {
-        st7735.st7735_write_str(0, 32, String(speedBuf));
+        st7735.setCursor(0, TEXT_ROW_2);
+        st7735.print(speedBuf);
         strcpy(prevSpeedBuf, speedBuf);
     }
     
     if (needsFullRedraw || strcmp(battBuf, prevBattBuf) != 0) {
-        st7735.st7735_write_str(0, 48, String(battBuf));
+        st7735.setCursor(0, TEXT_ROW_3);
+        st7735.print(battBuf);
         strcpy(prevBattBuf, battBuf);
     }
     
@@ -1227,19 +1269,27 @@ inline void HTITTracker::updateMainMenuScreen() {
     
     // Only redraw if menu selection changed or first time
     if (!screenInitialized || lastMenuIndex != menuIndex) {
-        st7735.st7735_fill_screen(ST7735_BLACK);
-        st7735.st7735_write_str(0, 0, "MAIN MENU");
+        st7735.fillScreen(ST7735_BLACK);
+        st7735.setCursor(0, TEXT_ROW_0);
+        st7735.print("MENU");
         
-        // Menu items with selection indicator (4 items total - removed Navigation)
-        String item0 = (menuIndex == 0) ? "> Status" : "  Status";
-        String item1 = (menuIndex == 1) ? "> Waypoints" : "  Waypoints";
-        String item2 = (menuIndex == 2) ? "> System Info" : "  System Info";
-        String item3 = (menuIndex == 3) ? "> Power Menu" : "  Power Menu";
+        // Menu items with selection indicator (5 items total - compact spacing)
+        String item0 = (menuIndex == 0) ? ">Status" : " Status";
+        String item1 = (menuIndex == 1) ? ">Waypnt" : " Waypnt";
+        String item2 = (menuIndex == 2) ? ">System" : " System";
+        String item3 = (menuIndex == 3) ? ">GPS St" : " GPS St";
+        String item4 = (menuIndex == 4) ? ">Power" : " Power";
         
-        st7735.st7735_write_str(0, 16, item0);
-        st7735.st7735_write_str(0, 32, item1);
-        st7735.st7735_write_str(0, 48, item2);
-        st7735.st7735_write_str(0, 64, item3);
+        st7735.setCursor(0, TEXT_ROW_1);
+        st7735.print(item0);
+        st7735.setCursor(0, TEXT_ROW_2);
+        st7735.print(item1);
+        st7735.setCursor(0, TEXT_ROW_3);
+        st7735.print(item2);
+        st7735.setCursor(0, TEXT_ROW_4);
+        st7735.print(item3);
+        st7735.setCursor(0, TEXT_ROW_5);
+        st7735.print(item4);
         
         lastMenuIndex = menuIndex;
         screenInitialized = true;
@@ -1270,36 +1320,36 @@ inline void HTITTracker::updateWaypointMenuScreen() {
     
     // Only redraw if menu selection changed, waypoint states changed, or first time
     if (!screenInitialized || lastMenuIndex != menuIndex || waypointStatesChanged) {
-        st7735.st7735_fill_screen(ST7735_BLACK);
-        st7735.st7735_write_str(0, 0, "WAYPOINTS");
+        st7735.fillScreen(ST7735_BLACK);
+        st7735.setCursor(0, ); st7735.print();
         
-        // Show waypoint status with X for unset waypoints
+        // Show waypoint status with X for unset waypoints - compact text
         String item0, item1, item2, item3;
         
         if (waypoints[0].isSet) {
-            item0 = (menuIndex == 0) ? "> Nav WP1" : "  Nav WP1";
+            item0 = (menuIndex == 0) ? ">Nav W1" : " Nav W1";
         } else {
-            item0 = (menuIndex == 0) ? "> Set WP1 X" : "  Set WP1 X";
+            item0 = (menuIndex == 0) ? ">Set W1" : " Set W1";
         }
         
         if (waypoints[1].isSet) {
-            item1 = (menuIndex == 1) ? "> Nav WP2" : "  Nav WP2";
+            item1 = (menuIndex == 1) ? ">Nav W2" : " Nav W2";
         } else {
-            item1 = (menuIndex == 1) ? "> Set WP2 X" : "  Set WP2 X";
+            item1 = (menuIndex == 1) ? ">Set W2" : " Set W2";
         }
         
         if (waypoints[2].isSet) {
-            item2 = (menuIndex == 2) ? "> Nav WP3" : "  Nav WP3";
+            item2 = (menuIndex == 2) ? ">Nav W3" : " Nav W3";
         } else {
-            item2 = (menuIndex == 2) ? "> Set WP3 X" : "  Set WP3 X";
+            item2 = (menuIndex == 2) ? ">Set W3" : " Set W3";
         }
         
-        item3 = (menuIndex == 3) ? "> Back" : "  Back";
+        item3 = (menuIndex == 3) ? ">Back" : " Back";
         
-        st7735.st7735_write_str(0, 16, item0);
-        st7735.st7735_write_str(0, 32, item1);
-        st7735.st7735_write_str(0, 48, item2);
-        st7735.st7735_write_str(0, 64, item3);
+        st7735.setCursor(0, ); st7735.print();
+        st7735.setCursor(0, ); st7735.print();
+        st7735.setCursor(0, ); st7735.print();
+        st7735.setCursor(0, ); st7735.print();
         
         lastMenuIndex = menuIndex;
         screenInitialized = true;
@@ -1385,16 +1435,16 @@ inline void HTITTracker::updateWaypointNavigationScreen(int pct_cal) {
     static bool needsFullRedraw = true;
     
     if (needsFullRedraw) {
-        st7735.st7735_fill_screen(ST7735_BLACK);
+        st7735.fillScreen(ST7735_BLACK);
         needsFullRedraw = false;
     }
     
-    // EXACT GitHub approach - single write per line with String() conversion
-    // Using default font and colors for clean, readable display
-    st7735.st7735_write_str(0, 0, String(dirBuf));
-    st7735.st7735_write_str(0, 16, String(distBuf));  
-    st7735.st7735_write_str(0, 32, String(speedBuf));
-    st7735.st7735_write_str(0, 48, String(battBuf));
+    // Compact approach - single write per line with String() conversion
+    // Using small white text with tight spacing for 5-row display
+    st7735.st7735_write_str(0, TEXT_ROW_0, String(dirBuf));
+    st7735.st7735_write_str(0, TEXT_ROW_1, String(distBuf));  
+    st7735.st7735_write_str(0, TEXT_ROW_2, String(speedBuf));
+    st7735.st7735_write_str(0, TEXT_ROW_3, String(battBuf));
 }
 
 inline void HTITTracker::updateWaypointResetScreen() {
@@ -1403,14 +1453,14 @@ inline void HTITTracker::updateWaypointResetScreen() {
     static int lastWaypointToReset = -1;
     
     if (!screenInitialized || forceScreenRedraw || lastMenuIndex != menuIndex || lastWaypointToReset != waypointToReset) {
-        st7735.st7735_fill_screen(ST7735_BLACK);
+        st7735.fillScreen(ST7735_BLACK);
         
         // Show which waypoint we're working with
-        char header[20];
-        snprintf(header, sizeof(header), "WAYPOINT %d", waypointToReset);
-        st7735.st7735_write_str(0, 0, header);
+        char header[16];
+        snprintf(header, sizeof(header), "WAYPT %d", waypointToReset);
+        st7735.setCursor(0, ); st7735.print();
         
-        // Show waypoint name if available
+        // Show waypoint name if available - compact
         const char* waypointName = "";
         if (waypointToReset == 1 && strlen(waypoints[0].name) > 0) {
             waypointName = waypoints[0].name;
@@ -1421,17 +1471,17 @@ inline void HTITTracker::updateWaypointResetScreen() {
         }
         
         if (strlen(waypointName) > 0) {
-            st7735.st7735_write_str(0, 16, waypointName);
+            st7735.setCursor(0, ); st7735.print();
         }
         
-        // Menu options
-        const char* item0 = (menuIndex == 0) ? "> Navigate" : "  Navigate";
-        const char* item1 = (menuIndex == 1) ? "> Reset" : "  Reset";
-        const char* item2 = (menuIndex == 2) ? "> Cancel" : "  Cancel";
+        // Compact menu options
+        const char* item0 = (menuIndex == 0) ? ">Nav" : " Nav";
+        const char* item1 = (menuIndex == 1) ? ">Reset" : " Reset";
+        const char* item2 = (menuIndex == 2) ? ">Cancel" : " Cancel";
         
-        st7735.st7735_write_str(0, 32, item0);
-        st7735.st7735_write_str(0, 48, item1);
-        st7735.st7735_write_str(0, 64, item2);
+        st7735.setCursor(0, ); st7735.print();
+        st7735.setCursor(0, ); st7735.print();
+        st7735.setCursor(0, ); st7735.print();
         
         lastMenuIndex = menuIndex;
         lastWaypointToReset = waypointToReset;
@@ -1455,18 +1505,18 @@ inline void HTITTracker::updateSetWaypointScreen() {
     bool needsRedraw = !screenInitialized || (gpsReady != lastGPSReady) || (totalInView != lastSatCount);
     
     if (needsRedraw) {
-        st7735.st7735_fill_screen(ST7735_BLACK);
+        st7735.fillScreen(ST7735_BLACK);
         
         char title[20];
         snprintf(title, sizeof(title), "SET WP%d", waypointToSet + 1);
-        st7735.st7735_write_str(0, 0, String(title));
+        st7735.st7735_write_str(0, TEXT_ROW_0, String(title));
         
         if (gpsReady) {
-            st7735.st7735_write_str(0, 16, "GPS Ready!");
-            st7735.st7735_write_str(0, 32, "Press to save");
+            st7735.setCursor(0, ); st7735.print();
+            st7735.setCursor(0, ); st7735.print();
         } else {
-            st7735.st7735_write_str(0, 16, "Wait for GPS...");
-            st7735.st7735_write_str(0, 32, String("Sats: " + String(totalInView)));
+            st7735.setCursor(0, ); st7735.print();
+            st7735.st7735_write_str(0, TEXT_ROW_2, String("Sats: " + String(totalInView)));
         }
         
         lastGPSReady = gpsReady;
@@ -1486,37 +1536,83 @@ inline void HTITTracker::updateSystemInfoScreen(int pct_cal) {
                        (pct_cal != lastBattPercent) || (currentPowerMode != lastMode);
     
     if (needsRedraw) {
-        st7735.st7735_fill_screen(ST7735_BLACK);
-        st7735.st7735_write_str(0, 0, "SYSTEM INFO Enhanced");
-        st7735.st7735_write_str(0, 12, "FW: v1.2 GPS+UI");
+        st7735.fillScreen(ST7735_BLACK);
+        st7735.setCursor(0, ); st7735.print();
         
-        // Enhanced satellite display with constellation breakdown
-        String satText = "Sats: " + String(totalInView);
+        // Compact satellite display with constellation breakdown
+        String satText = "Sats:" + String(totalInView);
         if (totalInView > 0) {
-            satText += " G:" + String(gpsCount) + " R:" + String(glonassCount) + 
-                      " B:" + String(beidouCount);
+            satText += " G:" + String(gpsCount) + " R:" + String(glonassCount);
         }
-        st7735.st7735_write_str(0, 24, satText);
+        st7735.setCursor(0, ); st7735.print();
         
-        // Enhanced battery display with charging indicator and progress bar
-        String battText = "Batt: " + String(pct_cal) + "%";
+        // Compact battery display with charging indicator
+        String battText = "Batt:" + String(pct_cal) + "%";
         if (isCharging) {
-            battText += " CHRG";  // Add charging indicator
+            battText += " CHG";  // Shorter charging indicator
         }
-        st7735.st7735_write_str(0, 36, battText);
+        st7735.setCursor(0, ); st7735.print();
         
-        // Show current power mode and motion state
-        String modeText = "Mode: " + String(getPowerModeString());
+        // Show current power mode and motion state - compact
+        String modeText = getPowerModeString();
         if (currentMotionState == MOTION_STATIONARY) modeText += " STAT";
         else if (currentMotionState == MOTION_MOVING) modeText += " MOV";
-        st7735.st7735_write_str(0, 48, modeText);
+        st7735.setCursor(0, ); st7735.print();
         
-        // Show GPS update interval for debugging
-        st7735.st7735_write_str(0, 60, String("GPS:" + String(gpsUpdateInterval/1000) + "s"));
+        // Show GPS update interval for debugging - compact
+        st7735.st7735_write_str(0, TEXT_ROW_4, String("GPS:" + String(gpsUpdateInterval/1000) + "s"));
         
         lastSatCount = totalInView;
         lastBattPercent = pct_cal;
         lastMode = currentPowerMode;
+        screenInitialized = true;
+    }
+}
+
+inline void HTITTracker::updateGPSStatusScreen(int pct_cal) {
+    static bool screenInitialized = false;
+    static int lastTotalSats = -1;
+    static bool lastFixStatus = false;
+    
+    bool needsRedraw = !screenInitialized || (totalInView != lastTotalSats) || (haveFix != lastFixStatus);
+    
+    if (needsRedraw) {
+        st7735.fillScreen(ST7735_BLACK);
+        st7735.setCursor(0, ); st7735.print();
+        
+        // Show overall fix status and total satellites
+        String fixLine = (haveFix ? "Fix:YES " : "Fix:NO ") + String("Tot:") + String(totalInView);
+        st7735.setCursor(0, ); st7735.print();
+        
+        // Show constellation counts in two compact lines
+        String line1 = "GPS:" + String(gpsCount) + " GLO:" + String(glonassCount);
+        String line2 = "BDS:" + String(beidouCount) + " GAL:" + String(galileoCount);
+        
+        st7735.setCursor(0, ); st7735.print();
+        st7735.setCursor(0, ); st7735.print();
+        
+        // Show primary constellation (most satellites contributing)
+        int primaryConstellation = -1;
+        int maxActiveSats = 0;
+        const char* constNames[] = {"GPS", "GLO", "BDS", "GAL", "QZS"};
+        
+        for (int i = 0; i < 5; i++) {
+            if (constellations[i].isActiveForFix && constellations[i].count > maxActiveSats) {
+                maxActiveSats = constellations[i].count;
+                primaryConstellation = i;
+            }
+        }
+        
+        String primaryText = "Primary:";
+        if (primaryConstellation >= 0) {
+            primaryText += String(constNames[primaryConstellation]);
+        } else {
+            primaryText += "None";
+        }
+        st7735.setCursor(0, ); st7735.print();
+        
+        lastTotalSats = totalInView;
+        lastFixStatus = haveFix;
         screenInitialized = true;
     }
 }
@@ -1530,8 +1626,8 @@ inline void HTITTracker::updatePowerMenuScreen() {
                       lastMenuIndex != menuIndex || lastPowerMode != currentPowerMode;
     
     if (needsRedraw) {
-        st7735.st7735_fill_screen(ST7735_BLACK);
-        st7735.st7735_write_str(0, 0, "POWER");
+        st7735.fillScreen(ST7735_BLACK);
+        st7735.setCursor(0, ); st7735.print();
         
         // Compact power menu options with current mode indicator
         String item0 = (menuIndex == 0) ? ">" : " ";
@@ -1548,10 +1644,10 @@ inline void HTITTracker::updatePowerMenuScreen() {
         
         const char* item3 = (menuIndex == 3) ? ">Back" : " Back";
         
-        st7735.st7735_write_str(0, 16, item0);
-        st7735.st7735_write_str(0, 32, item1);
-        st7735.st7735_write_str(0, 48, item2);
-        st7735.st7735_write_str(0, 64, item3);
+        st7735.setCursor(0, ); st7735.print();
+        st7735.setCursor(0, ); st7735.print();
+        st7735.setCursor(0, ); st7735.print();
+        st7735.setCursor(0, ); st7735.print();
         
         lastMenuIndex = menuIndex;
         lastPowerMode = currentPowerMode;
@@ -1668,15 +1764,18 @@ inline float HTITTracker::calculateDistanceToWaypoint(int waypointIndex) {
 
 inline void HTITTracker::updateConstellationInfo() {
     // Update constellation statistics
-    constellations[0].count = gpsCount;
-    constellations[1].count = glonassCount;
-    constellations[2].count = beidouCount;
-    constellations[3].count = galileoCount;
-    constellations[4].count = qzssCount;
+    constellations[0].count = gpsCount;      // GPS (USA)
+    constellations[1].count = glonassCount;  // GLONASS (Russia)
+    constellations[2].count = beidouCount;   // Beidou (China)
+    constellations[3].count = galileoCount;  // Galileo (EU)
+    constellations[4].count = qzssCount;     // QZSS (Japan)
     
-    // Check which constellations have fixes
+    // Check which constellations have fixes and are contributing to the solution
     for (int i = 0; i < 5; i++) {
         constellations[i].hasFix = (constellations[i].count > 0 && haveFix);
+        // For now, assume all constellations with satellites are contributing if we have a fix
+        // In a real implementation, this would come from GGA or RMC sentence analysis
+        constellations[i].isActiveForFix = (constellations[i].count >= 4 && haveFix);
     }
 }
 
@@ -1788,32 +1887,34 @@ inline void HTITTracker::drawProgressBar(int x, int y, int width, int height, in
 }
 
 inline void HTITTracker::drawBatteryIcon(int x, int y, int percentage) {
-    // Create text-based battery indicator
-    char battIcon[8];
+    // Create text-based battery indicator with percentage
+    char battIcon[12];
     if (percentage > 75) {
-        strcpy(battIcon, "BATT +++");
+        strcpy(battIcon, "BATT 100%");
     } else if (percentage > 50) {
-        strcpy(battIcon, "BATT ++");
+        strcpy(battIcon, "BATT 75%");
     } else if (percentage > 25) {
-        strcpy(battIcon, "BATT +");
+        strcpy(battIcon, "BATT 50%");
     } else {
-        strcpy(battIcon, "BATT LOW");
+        strcpy(battIcon, "BATT 25%");
     }
     
     st7735.st7735_write_str(x, y, battIcon);
 }
 
 inline void HTITTracker::drawGPSIcon(int x, int y, int signalStrength) {
-    // Create text-based GPS signal indicator
+    // Create text-based GPS signal indicator with percentage
     char gpsIcon[12];
-    if (signalStrength >= 8) {
-        strcpy(gpsIcon, "GPS +++");
+    if (signalStrength >= 12) {
+        strcpy(gpsIcon, "GPS 100%");
+    } else if (signalStrength >= 8) {
+        strcpy(gpsIcon, "GPS 75%");
     } else if (signalStrength >= 4) {
-        strcpy(gpsIcon, "GPS ++");
+        strcpy(gpsIcon, "GPS 50%");
     } else if (signalStrength >= 1) {
-        strcpy(gpsIcon, "GPS +");
+        strcpy(gpsIcon, "GPS 25%");
     } else {
-        strcpy(gpsIcon, "GPS ---");
+        strcpy(gpsIcon, "GPS 0%");
     }
     
     st7735.st7735_write_str(x, y, gpsIcon);
