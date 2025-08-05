@@ -14,6 +14,7 @@
 #define VBAT_EN       2   // GPIO 2 must be HIGH to connect that divider
 #define BL_CTRL_PIN  21   // GPIO 21 enables ST7735 backlight (HIGH = on)
 #define USER_BTN_PIN  0   // GPIO 0 is the USER button (active-low)
+#define LED_PIN      35   // GPIO 35 for white LED indicator (built-in LED on Heltec, active-high)
 
 // EEPROM ADDRESSES
 #define EEPROM_SIZE 512
@@ -134,6 +135,11 @@ private:
     char lineBuf[128];
     int linePos;
     
+    // LED blink indicator variables
+    bool ledBlinkActive;
+    unsigned long ledBlinkStartTime;
+    static const unsigned long LED_BLINK_DURATION = 50; // 50ms blink duration
+    
     // Timing for LCD refresh (once per second)
     unsigned long lastLCDupdate;
     static const unsigned long LCD_INTERVAL = 1000; // ms
@@ -163,6 +169,8 @@ private:
     void calculateSpeed();
     int getStableBatteryPercent(float voltage);
     void updateChargingStatus(float voltage);
+    void triggerLEDBlink();
+    void updateLEDState();
     
     // Enhanced navigation methods
     float calculateBearingToHome();
@@ -213,7 +221,8 @@ inline HTITTracker::HTITTracker()
       lastActivity(0), forceScreenRedraw(false), lastLat(0.0), lastLon(0.0), 
       lastSpeedTime(0), currentSpeed(0.0f), hasValidSpeed(false), 
       prevDisplayValid(false), batteryIndex(0), batteryBufferFull(false), 
-      lastBatteryVoltage(0.0f), isCharging(false), lastChargingCheck(0) {
+      lastBatteryVoltage(0.0f), isCharging(false), lastChargingCheck(0),
+      ledBlinkActive(false), ledBlinkStartTime(0) {
     
     // Initialize waypoints as unset
     for (int i = 0; i < 3; i++) {
@@ -262,6 +271,11 @@ inline void HTITTracker::begin() {
     pinMode(USER_BTN_PIN, INPUT_PULLUP);
     Serial.println("→ USER_BTN (GPIO 0) configured with pullup");
 
+    // 5.5) Configure LED indicator
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, LOW);  // Start with LED off
+    Serial.println("→ LED_PIN (GPIO 35) configured as output");
+
     // 6) Set ADC attenuation so VBAT/2 (≈0.857–1.07 V) reads accurately
     analogSetPinAttenuation(VBAT_PIN, ADC_11db);
 
@@ -282,6 +296,9 @@ inline void HTITTracker::begin() {
 inline void HTITTracker::update() {
     // A) Check button for screen switching
     checkButton();
+    
+    // A.5) Update LED state
+    updateLEDState();
     
     // B) Read raw NMEA from Serial1, echo to USB-Serial, accumulate lines
     while (Serial1.available() > 0) {
@@ -368,6 +385,11 @@ inline void HTITTracker::processNMEALine(const char* line) {
             currentLat = lat;
             currentLon = lon;
             hasValidPosition = true;
+            
+            // Trigger LED blink when we have a fix and get position data
+            if (haveFix) {
+                triggerLEDBlink();
+            }
             
             // Calculate speed if we have a previous position
             calculateSpeed();
@@ -1472,6 +1494,28 @@ inline float HTITTracker::calculateDistanceToWaypoint(int waypointIndex) {
     const double EARTH_RADIUS = 6371000.0;
     
     return EARTH_RADIUS * c;  // Distance in meters
+}
+
+// ========================== LED INDICATOR METHODS ==========================
+
+inline void HTITTracker::triggerLEDBlink() {
+    // Only trigger if not already blinking
+    if (!ledBlinkActive) {
+        ledBlinkActive = true;
+        ledBlinkStartTime = millis();
+        digitalWrite(LED_PIN, HIGH);  // Turn LED on
+    }
+}
+
+inline void HTITTracker::updateLEDState() {
+    // Check if LED blink is active and time has expired
+    if (ledBlinkActive) {
+        unsigned long now = millis();
+        if (now - ledBlinkStartTime >= LED_BLINK_DURATION) {
+            ledBlinkActive = false;
+            digitalWrite(LED_PIN, LOW);  // Turn LED off
+        }
+    }
 }
 
 #endif // MAIN_H
