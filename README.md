@@ -1,3 +1,7 @@
+> **☕ Support my work**
+>
+> If this project has helped you, consider supporting my work on [**Buy Me a Coffee**](https://buymeacoffee.com/j6oiubzfnh).
+
 # 🛰️ HTIT-Tracker GPS Navigation System
 ### *The Ultimate Personal GPS Navigation Device for Beginners*
 
